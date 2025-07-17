@@ -25,6 +25,11 @@ pub struct BLEServer {
   on_confirm_pin: Option<Box<dyn Fn(u32) -> bool + Send + Sync>>,
   on_authentication_complete:
     Option<Box<dyn Fn(&mut Self, &BLEConnDesc, Result<(), BLEError>) + Send + Sync>>,
+  /// Callback fired whenever the negotiated MTU for a connection changes.
+  on_mtu_update: Option<Box<dyn FnMut(&BLEConnDesc, u16) + Send + Sync>>,
+
+  /// Callback fired when connection parameters (interval / latency / timeout) change.
+  on_conn_param_update: Option<Box<dyn FnMut(&BLEConnDesc) + Send + Sync>>,
 }
 
 impl BLEServer {
@@ -41,6 +46,8 @@ impl BLEServer {
       on_passkey_request: None,
       on_confirm_pin: None,
       on_authentication_complete: None,
+      on_mtu_update: None,
+      on_conn_param_update: None,
     }
   }
 
@@ -105,6 +112,24 @@ impl BLEServer {
     callback: impl Fn(&mut Self, &BLEConnDesc, Result<(), BLEError>) + Send + Sync + 'static,
   ) -> &mut Self {
     self.on_authentication_complete = Some(Box::new(callback));
+    self
+  }
+
+  /// Register a callback invoked when the negotiated MTU changes.
+  pub fn on_mtu_update(
+    &mut self,
+    callback: impl FnMut(&BLEConnDesc, u16) + Send + Sync + 'static,
+  ) -> &mut Self {
+    self.on_mtu_update = Some(Box::new(callback));
+    self
+  }
+
+  /// Register a callback invoked after a successful connection-parameter update.
+  pub fn on_conn_param_update(
+    &mut self,
+    callback: impl FnMut(&BLEConnDesc) + Send + Sync + 'static,
+  ) -> &mut Self {
+    self.on_conn_param_update = Some(Box::new(callback));
     self
   }
 
@@ -241,6 +266,8 @@ impl BLEServer {
     self.on_passkey_request = None;
     self.on_confirm_pin = None;
     self.on_authentication_complete = None;
+    self.on_mtu_update = None;
+    self.on_conn_param_update = None;
   }
 
   pub(crate) extern "C" fn handle_gap_event(
@@ -322,6 +349,12 @@ impl BLEServer {
           mtu.conn_handle,
           mtu.value
         );
+
+        if let Ok(desc) = ble_gap_conn_find(mtu.conn_handle) {
+          if let Some(cb) = server.on_mtu_update.as_mut() {
+            cb(&desc, mtu.value);
+          }
+        }
       }
       esp_idf_sys::BLE_GAP_EVENT_NOTIFY_TX => {
         let notify_tx = unsafe { &event.__bindgen_anon_1.notify_tx };
@@ -354,7 +387,18 @@ impl BLEServer {
         return crate::BLEExtAdvertising::handle_gap_event(_event, _arg);
       }
       esp_idf_sys::BLE_GAP_EVENT_CONN_UPDATE => {
-        ::log::debug!("Connection parameters updated.");
+        let cu = unsafe { &event.__bindgen_anon_1.conn_update };
+
+        // SAFETY: layout comes from NimBLE headers; we don't depend on field names here.
+        let conn_handle = unsafe { core::ptr::read(&cu.conn_handle) };
+
+        ::log::debug!("Connection parameters updated for handle {}", conn_handle);
+
+        if let Ok(desc) = ble_gap_conn_find(conn_handle) {
+          if let Some(cb) = server.on_conn_param_update.as_mut() {
+            cb(&desc);
+          }
+        }
       }
       esp_idf_sys::BLE_GAP_EVENT_CONN_UPDATE_REQ => {}
       esp_idf_sys::BLE_GAP_EVENT_REPEAT_PAIRING => {
